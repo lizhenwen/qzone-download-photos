@@ -1,10 +1,10 @@
 const axios = require("axios");
+const { error, log } = require("console");
 const fs = require("fs");
 
 //在控制台运行  alert(document.cookie)
 //然后把内容粘贴到 COOKIE 变量下
-const COOKIE =
-  "RK=zEF1x7iybf; ptcz=bdd10a82e1fee4453d0e9c3ec2f98083139d7c9ef96a3162c37da9dfa090de61; ptui_loginuin=67401840; _clck=1jnyatf|1|fp1|0; pgv_pvid=9ffead1705c2efd8; _qimei_q36=; _qimei_h38=fa620d7552886a96ad68e8510300000c218509; p_uin=o0067401840; SL_G_WPT_TO=en; SL_GWPT_Show_Hide_tmp=1; SL_wptGlobTipTmp=1; qqmusic_uin=0067401840; qqmusic_fromtag=6; 67401840_todaycount=0; 67401840_totalcount=15380; pgv_info=ssid=s9733420016; QZ_FE_WEBP_SUPPORT=1; cpu_performance_v8=1; __Q_w_s__QZN_TodoMsgCnt=1; uin=o0067401840; skey=@HF7ilJ4iy; pt4_token=ENlT7YfB6RMXPvMYzRzNozhKh28kG3F0Pmh-T8rii2U_; p_skey=yRxkdm62GEuIpYpe6Q6cu8Xget*csr4cu0CCWzFvafM_; Loading=Yes; qz_screen=1920x1080; qqmusic_key=@HF7ilJ4iy; qzmusicplayer=qzone_player_67401840_1726734030299";
+let COOKIE;
 const downloadFileName = "./photo_data.json";
 
 const Tools = {
@@ -103,6 +103,7 @@ const Photos = {
 }
 
 async function downloadData() {
+  console.log("开始下载照片数据.....");
   let data = [];
 
   let albums = await Photos.getAlbumList();
@@ -115,7 +116,22 @@ async function downloadData() {
     });
   }
   fs.writeFileSync(downloadFileName, JSON.stringify(data, null, 2));
-  console.log(`已下载照片数据到 ${downloadFileName}`);
+  console.log(`已将照片数据保存到 ${downloadFileName}`);
+
+  return data;
 }
 
-downloadData();
+async function start() {
+  //初始化 cookie
+  COOKIE = (fs.readFileSync("./cookie.txt", "utf8") || "").trim();
+  if (!COOKIE) {
+    console.error("-----------------------WARNING-----------------------------\n");
+    console.error("请登录 qzone.qq.com，然后将 cookie 复制到 cookie.txt 文件内。");
+    console.error("\n------------------------------------------------------------");
+    return 
+  }
+  
+  let data = await downloadData();
+}
+
+start();
