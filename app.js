@@ -281,8 +281,8 @@ async function start() {
     return;
   }
 
-  // let data = await downloadData();
-  let data = JSON.parse(fs.readFileSync(downloadFilePath));
+  let data = await downloadData();
+  // let data = JSON.parse(fs.readFileSync(downloadFilePath));
 
   for (let i = 0; i < data.length; i++) {
     let album = data[i];
@@ -300,23 +300,3 @@ async function start() {
 }
 
 start();
-
-// exifr
-//   .parse(
-//     "/Users/lizhenwen/Desktop/dev_self/qzone-download-photos/export/香港澳门2019年/2022-05-09_05-50-23.jpg"
-//   )
-//   .then((output) => console.log(output));
-
-// const fileBuffer = fs
-//   .readFileSync(
-//     "/Users/lizhenwen/Desktop/dev_self/qzone-download-photos/export/psc.jpeg"
-//   )
-
-//         let exifObj;
-
-//           // 如果不是标准的 JPEG 文件头，尝试转换为 base64 再处理
-//           const base64Data = fileBuffer.toString("base64");
-//           const base64Image = `data:image/jpeg;base64,${base64Data}`;
-//           exifObj = piexifjs.load(base64Image);
-
-//           console.log(exifObj);
