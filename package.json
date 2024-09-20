@@ -9,6 +9,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "axios": "^1.7.7"
+    "axios": "^1.7.7",
+    "exifr": "^7.1.3"
   }
 }
