@@ -2,15 +2,16 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const exifr = require("exifr");
-
 const { exec } = require("child_process");
+
+//是否忽略本地存在的照片
+const IgnoreExistingPhotos = true;
 
 exec("exiftool -ver", (err, stdout, stderr) => {
   if (err) {
     console.error("****** 如果需要给照片写入 exif，请手动安装 exiftool: https://exiftool.org/ ******");
   }
 });
-
 
 //在控制台运行  alert(document.cookie)
 //然后把内容粘贴到 COOKIE 变量下
@@ -89,6 +90,10 @@ const Photos = {
       });
 
       rs = resp?.data?.data?.albumListModeSort;
+      if (!rs) {
+        console.log(resp?.data || resp);
+        throw new Error("相册数据拉取失败");
+      }
     } catch (error) {
       console.log(`getAlbumList axios error: `);
 
@@ -189,7 +194,7 @@ const Photos = {
     const hours = String(dateObj.getHours()).padStart(2, "0");
     const minutes = String(dateObj.getMinutes()).padStart(2, "0");
     const seconds = String(dateObj.getSeconds()).padStart(2, "0");
-    const fileName = `${year}-${month}-${day}_${hours}-${minutes}-${seconds}`;
+    const fileName = `${year}-${month}-${day}_${hours}-${minutes}-${seconds}_${photoInfo.photocubage}`;
 
     return fileName.trim();
   },
@@ -200,6 +205,11 @@ async function downloadData() {
   let data = [];
 
   let albums = await Photos.getAlbumList();
+  if (!albums) {
+    console.error("***拉取相册数据失败***");
+    
+    return 
+  }
   for (let album of albums) {
     let photos = await Photos.getPhotoList(album);
     data.push({
@@ -233,31 +243,45 @@ async function downloadFile(photoInfo, albumInfo) {
 
   const savePath = path.join(savedFolderPath, photoName);
 
+  //如果本地存在照片，则不下载
+  if (IgnoreExistingPhotos && fs.existsSync(savePath)) {
+    console.log(`本地文件已存在，不下载：${savePath}`);
+    return 
+  }
+
   try {
     // 下载图片到本地
     const response = await axios({
       url: fileUrl,
-      responseType: "stream",
+      responseType: "arraybuffer",
     });
-    response.data.pipe(fs.createWriteStream(savePath));
+
+    fs.writeFileSync(savePath, Buffer.from(response.data));
     console.log(`下载成功：${savePath}`);
+
+    await Tools.sleep(300);
 
     //照片，写入 exif
     if (!photoInfo.is_video) {
-      await Tools.sleep(300);
-
       let exifData = await exifr.parse(savePath);
       if (!exifData || !exifData.DateTimeOriginal) {
         exifData = exifData || {};
-        exifData.DateTimeOriginal = Tools.formatExifTime(photoInfo?.exif?.originalTime || photoInfo.rawshoottime || photoInfo.uploadtime);
+        exifData.DateTimeOriginal = Tools.formatExifTime(
+          photoInfo?.exif?.originalTime ||
+            photoInfo.rawshoottime ||
+            photoInfo.uploadtime
+        );
 
-        exec(`exiftool -overwrite_original -DateTimeOriginal="${exifData.DateTimeOriginal}" "${savePath}"`, (err, stdout, stderr) => {
-          if (err) {
-            // console.error('写入 Exif 信息失败:', err);
-            return;
+        exec(
+          `exiftool -overwrite_original -DateTimeOriginal="${exifData.DateTimeOriginal}" "${savePath}"`,
+          (err, stdout, stderr) => {
+            if (err) {
+              // console.error('写入 Exif 信息失败:', err);
+              return;
+            }
+            console.log(`写入Exif 信息成功: ${savePath}`);
           }
-          console.log(`写入Exif 信息成功: ${savePath}`);
-        });
+        );
       }
     }
   } catch (error) {
