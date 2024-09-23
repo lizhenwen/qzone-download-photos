@@ -18,6 +18,7 @@
 如果需要写入 exif，请先安装`exiftool`：
 
 windows 直接去官网下载： https://exiftool.org/
+(下载后解压到项目主目录，确保 exe 文件和 app.js 在一个目录，并把 exe 文件名改为`exiftool.exe`)
 
 mac 执行`brew install exiftool`
 
