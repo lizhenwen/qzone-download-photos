@@ -1,6 +1,7 @@
 /export/*
 /export_old/*
 cookie.txt
+*.zip
 
 # Logs
 logs
