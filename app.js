@@ -2,16 +2,10 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const exifr = require("exifr");
-const { exec } = require("child_process");
+const { exiftool } = require("exiftool-vendored");
 
 //是否忽略本地存在的照片
 const IgnoreExistingPhotos = true;
-
-exec("exiftool -ver", (err, stdout, stderr) => {
-  if (err) {
-    console.error("****** 如果需要给照片写入 exif，请手动安装 exiftool: https://exiftool.org/ ******");
-  }
-});
 
 //在控制台运行  alert(document.cookie)
 //然后把内容粘贴到 COOKIE 变量下
@@ -265,23 +259,25 @@ async function downloadFile(photoInfo, albumInfo) {
     if (!photoInfo.is_video) {
       let exifData = await exifr.parse(savePath);
       if (!exifData || !exifData.DateTimeOriginal) {
-        exifData = exifData || {};
-        exifData.DateTimeOriginal = Tools.formatExifTime(
+        const dateTimeOriginal = Tools.formatExifTime(
           photoInfo?.exif?.originalTime ||
             photoInfo.rawshoottime ||
             photoInfo.uploadtime
         );
-
-        exec(
-          `exiftool -overwrite_original -DateTimeOriginal="${exifData.DateTimeOriginal}" "${savePath}"`,
-          (err, stdout, stderr) => {
-            if (err) {
-              // console.error('写入 Exif 信息失败:', err);
-              return;
-            }
+        if (!dateTimeOriginal) {
+          console.error(`无法解析拍照时间，跳过写入 Exif：${savePath}`);
+        } else {
+          try {
+            await exiftool.write(
+              savePath,
+              { DateTimeOriginal: dateTimeOriginal },
+              { writeArgs: ["-overwrite_original"] }
+            );
             console.log(`写入Exif 信息成功: ${savePath}`);
+          } catch (err) {
+            console.error(`写入 Exif 信息失败: ${savePath}`, err);
           }
-        );
+        }
       }
     }
   } catch (error) {
@@ -290,36 +286,40 @@ async function downloadFile(photoInfo, albumInfo) {
 }
 
 async function start() {
-  //初始化 cookie
-  COOKIE = (fs.readFileSync("./cookie.txt", "utf8") || "").trim();
-  if (!COOKIE) {
-    console.error(
-      "-----------------------WARNING-----------------------------\n"
-    );
-    console.error(
-      "请登录 qzone.qq.com，然后将 cookie 复制到 cookie.txt 文件内。"
-    );
-    console.error(
-      "\n------------------------------------------------------------"
-    );
-    return;
-  }
-
-  let data = await downloadData();
-  // let data = JSON.parse(fs.readFileSync(downloadFilePath));
-
-  for (let i = 0; i < data.length; i++) {
-    let album = data[i];
-
-    let photosData = album.photos;
-    if (photosData && photosData.length > 0) {
-      for (let j = 0; j < photosData.length; j++) {
-        let photoInfo = photosData[j];
-        await downloadFile(photoInfo, album);
-      }
-    } else {
-      console.log(`相册 ${album.name} 没有照片，跳过。`);
+  try {
+    //初始化 cookie
+    COOKIE = (fs.readFileSync("./cookie.txt", "utf8") || "").trim();
+    if (!COOKIE) {
+      console.error(
+        "-----------------------WARNING-----------------------------\n"
+      );
+      console.error(
+        "请登录 qzone.qq.com，然后将 cookie 复制到 cookie.txt 文件内。"
+      );
+      console.error(
+        "\n------------------------------------------------------------"
+      );
+      return;
     }
+
+    let data = await downloadData();
+    // let data = JSON.parse(fs.readFileSync(downloadFilePath));
+
+    for (let i = 0; i < data.length; i++) {
+      let album = data[i];
+
+      let photosData = album.photos;
+      if (photosData && photosData.length > 0) {
+        for (let j = 0; j < photosData.length; j++) {
+          let photoInfo = photosData[j];
+          await downloadFile(photoInfo, album);
+        }
+      } else {
+        console.log(`相册 ${album.name} 没有照片，跳过。`);
+      }
+    }
+  } finally {
+    await exiftool.end();
   }
 }
 
