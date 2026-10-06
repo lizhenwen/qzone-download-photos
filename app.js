@@ -1,4 +1,5 @@
 const axios = require("axios");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const exifr = require("exifr");
@@ -17,6 +18,9 @@ if (!fs.existsSync(exportDir)) {
 }
 
 const downloadFilePath = path.join(exportDir,"./photo_data.json");
+const errorLogPath = path.join(exportDir, "download-errors.log");
+let downloadErrorCount = 0;
+let errorLogHeaderWritten = false;
 
 const Tools = {
   getACSRFToken(cookieStr) {
@@ -395,44 +399,37 @@ const Photos = {
     let topicId = albumInfo.id;
     let picKey = photoInfo.lloc;
 
-    let rs;
+    const resp = await axios.get(url, {
+      params: {
+        g_tk: Tools.getACSRFToken(COOKIE),
+        hostUin: Tools.getCookie(COOKIE, "ptui_loginuin"),
+        uin: Tools.getCookie(COOKIE, "ptui_loginuin"),
+        picKey,
+        topicId,
+        pageStart: 0,
+        pageNum: 1000000,
+      },
+      headers: {
+        cookie: COOKIE,
+      },
+    });
 
-    try {
-      const resp = await axios.get(url, {
-        params: {
-          g_tk: Tools.getACSRFToken(COOKIE),
-          hostUin: Tools.getCookie(COOKIE, "ptui_loginuin"),
-          uin: Tools.getCookie(COOKIE, "ptui_loginuin"),
-          picKey,
-          topicId,
-          pageStart: 0,
-          pageNum: 1000000,
-        },
-        headers: {
-          cookie: COOKIE,
-        },
-      });
-
-      let resData = resp?.data?.data?.photos;
-      if (resData && resData.length > 0) {
-        resData.forEach((ele) => {
-          let { lloc } = ele;
-          if (lloc === picKey) {
-            rs = (
-              ele?.video_info?.download_url ||
-              ele?.video_info?.video_url ||
-              ""
-            ).trim();
-          }
-        });
-      } else {
-        console.error("getVideoUrl 未拉取到照片数据");
-      }
-    } catch (error) {
-      console.log(`getVideoUrl axios error: `);
-
-      console.error(error);
+    let resData = resp?.data?.data?.photos;
+    if (!resData || resData.length === 0) {
+      throw new Error("getVideoUrl 未拉取到照片数据");
     }
+
+    let rs;
+    resData.forEach((ele) => {
+      let { lloc } = ele;
+      if (lloc === picKey) {
+        rs = (
+          ele?.video_info?.download_url ||
+          ele?.video_info?.video_url ||
+          ""
+        ).trim();
+      }
+    });
 
     return rs;
   },
@@ -446,7 +443,9 @@ const Photos = {
     const hours = String(dateObj.getHours()).padStart(2, "0");
     const minutes = String(dateObj.getMinutes()).padStart(2, "0");
     const seconds = String(dateObj.getSeconds()).padStart(2, "0");
-    const fileName = `${year}-${month}-${day}_${hours}-${minutes}-${seconds}_${photoInfo.photocubage}`;
+    const key = Tools.photoKey(photoInfo) || String(photoInfo.raw || photoInfo.url || "");
+    const id = crypto.createHash("sha1").update(key).digest("hex").slice(0, 8);
+    const fileName = `${year}-${month}-${day}_${hours}-${minutes}-${seconds}_${photoInfo.photocubage}_${id}`;
 
     return fileName.trim();
   },
@@ -476,12 +475,106 @@ async function downloadData() {
   return data;
 }
 
-async function writePhotoExif(savePath, photoInfo) {
+const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
+
+function readFileHeader(filePath, size = 16) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const header = Buffer.alloc(size);
+    const n = fs.readSync(fd, header, 0, size, 0);
+    return header.subarray(0, n);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function detectImageExt(header) {
+  if (!header || header.length < 3) return "";
+  if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return ".jpg";
+  if (
+    header.length >= 4 &&
+    header[0] === 0x89 &&
+    header[1] === 0x50 &&
+    header[2] === 0x4e &&
+    header[3] === 0x47
+  ) {
+    return ".png";
+  }
+  if (header.length >= 6) {
+    const gif = header.toString("ascii", 0, 6);
+    if (gif === "GIF87a" || gif === "GIF89a") return ".gif";
+  }
+  if (
+    header.length >= 12 &&
+    header.toString("ascii", 0, 4) === "RIFF" &&
+    header.toString("ascii", 8, 12) === "WEBP"
+  ) {
+    return ".webp";
+  }
+  return "";
+}
+
+function extensionMatches(current, actual) {
+  const cur = String(current || "").toLowerCase();
+  if (cur === actual) return true;
+  return actual === ".jpg" && cur === ".jpeg";
+}
+
+// QQ 原图有时是 PNG/GIF/WebP，但链接没有扩展名，之前一律存成 .jpg。
+function alignImageExtension(savePath) {
+  let actual = "";
+  try {
+    actual = detectImageExt(readFileHeader(savePath));
+  } catch (error) {
+    return savePath;
+  }
+  if (!actual) return savePath;
+  const current = path.extname(savePath);
+  if (extensionMatches(current, actual)) return savePath;
+
+  const nextPath = path.join(
+    path.dirname(savePath),
+    path.basename(savePath, current) + actual
+  );
+  if (fs.existsSync(nextPath)) {
+    console.log(`已有正确扩展名文件，改用：${nextPath}`);
+    return nextPath;
+  }
+  fs.renameSync(savePath, nextPath);
+  console.log(`文件实际是 ${actual.slice(1).toUpperCase()}，已改名：${nextPath}`);
+  return nextPath;
+}
+
+function findSavedPhoto(folder, baseName) {
+  const found = IMAGE_EXTENSIONS.map((ext) => path.join(folder, baseName + ext)).filter(
+    (filePath) => fs.existsSync(filePath)
+  );
+  if (!found.length) return "";
+  const matched = found.find((filePath) => {
+    try {
+      const actual = detectImageExt(readFileHeader(filePath));
+      return actual && extensionMatches(path.extname(filePath), actual);
+    } catch (error) {
+      return false;
+    }
+  });
+  return matched || found[0];
+}
+
+async function writeExifTags(savePath, tags) {
+  await exiftool.write(savePath, tags, {
+    writeArgs: ["-overwrite_original", "-charset", "utf8"],
+  });
+}
+
+async function writePhotoExif(savePath, photoInfo, albumInfo) {
+  savePath = alignImageExtension(savePath);
+
   let exifData = null;
   try {
     exifData = await exifr.parse(savePath);
   } catch (error) {
-    console.error(`读取 Exif 失败：${savePath}`, error.message || error);
+    console.error(`读取 Exif 失败：${savePath} ${error.message || error}`);
   }
 
   const tags = {};
@@ -514,49 +607,143 @@ async function writePhotoExif(savePath, photoInfo) {
     tags.XPComment = place;
   }
 
-  if (!Object.keys(tags).length) return;
+  if (!Object.keys(tags).length) return savePath;
+
+  const parts = [];
+  if (tags.DateTimeOriginal) parts.push("拍摄时间");
+  if (tags.GPSLatitude != null) parts.push("坐标");
+  if (tags.UserComment) parts.push("地名");
 
   try {
-    await exiftool.write(savePath, tags, {
-      writeArgs: ["-overwrite_original", "-charset", "utf8"],
-    });
-    const parts = [];
-    if (tags.DateTimeOriginal) parts.push("拍摄时间");
-    if (tags.GPSLatitude != null) parts.push("坐标");
-    if (tags.UserComment) parts.push("地名");
+    await writeExifTags(savePath, tags);
     console.log(`写入 Exif（${parts.join("、")}）：${savePath}`);
   } catch (err) {
-    console.error(`写入 Exif 失败：${savePath}`, err);
+    const message = String(err?.message || err);
+    if (/looks more like a PNG/i.test(message) && /\.jpe?g$/i.test(savePath)) {
+      const pngPath = savePath.replace(/\.jpe?g$/i, ".png");
+      if (!fs.existsSync(pngPath)) fs.renameSync(savePath, pngPath);
+      savePath = fs.existsSync(pngPath) ? pngPath : savePath;
+      try {
+        await writeExifTags(savePath, tags);
+        console.log(`写入 Exif（${parts.join("、")}）：${savePath}`);
+        return savePath;
+      } catch (retryErr) {
+        err = retryErr;
+      }
+    }
+    recordDownloadError({
+      album: albumInfo,
+      photo: photoInfo,
+      photoName: path.basename(savePath),
+      savePath,
+      fileUrl: photoInfo?.raw || photoInfo?.origin_url || photoInfo?.url || "",
+      error: err,
+      stage: "写入 Exif",
+    });
   }
+  return savePath;
+}
+
+function formatNow() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function recordDownloadError({
+  album,
+  photo,
+  photoName,
+  savePath,
+  fileUrl,
+  error,
+  stage = "下载",
+}) {
+  downloadErrorCount += 1;
+  const code = error?.code || error?.cause?.code || "";
+  const status = error?.response?.status;
+  const message = String(error?.message || error || "未知错误").split("\n")[0];
+  const albumName = album?.name || "未知相册";
+  const photoLabel = photoName || photo?.lloc || "未知照片";
+
+  if (!errorLogHeaderWritten) {
+    const prefix =
+      fs.existsSync(errorLogPath) && fs.statSync(errorLogPath).size > 0
+        ? "\n"
+        : "";
+    fs.appendFileSync(
+      errorLogPath,
+      `${prefix}========== ${formatNow()} ==========\n`,
+      "utf8"
+    );
+    errorLogHeaderWritten = true;
+  }
+
+  const lines = [
+    `[${formatNow()}]`,
+    `阶段：${stage}`,
+    `相册：${albumName}`,
+    `相册ID：${album?.id || ""}`,
+    `照片：${photoLabel}`,
+    `照片ID：${photo?.lloc || photo?.sloc || ""}`,
+    `类型：${photo?.is_video ? "视频" : "图片"}`,
+    `保存路径：${savePath || ""}`,
+    `链接：${fileUrl || ""}`,
+  ];
+  if (code) lines.push(`错误代码：${code}`);
+  if (status) lines.push(`HTTP状态：${status}`);
+  lines.push(`错误信息：${message}`, "");
+
+  fs.appendFileSync(errorLogPath, lines.join("\n"), "utf8");
+  console.error(
+    `✕✕✕❌❌❌${stage}失败❌❌❌✕✕✕：相册「${albumName}」照片「${photoLabel}」${code ? code + " " : ""}${message}`,
+  );
 }
 
 async function downloadFile(photoInfo, albumInfo) {
-  let fileUrl = photoInfo.raw || photoInfo.url;
-  if (photoInfo.is_video) {
-    fileUrl = await Photos.getVideoUrl(albumInfo, photoInfo);
-  }
-
-  if (!fileUrl) {
-    console.error(`未获取到下载链接，photo.lloc=${photoInfo.lloc}, album.id=${albumInfo.id}`);
-    return 
-  }
-
   const albumName = albumInfo.name;
-  const photoName = Photos.parsePhotoName(photoInfo)+(photoInfo.is_video?".mp4":".jpg");
-  
-  const savedFolderPath = path.join(exportDir, albumName);
-  if (!fs.existsSync(savedFolderPath)) fs.mkdirSync(savedFolderPath, { recursive: true });
-
-  const savePath = path.join(savedFolderPath, photoName);
-
-  //本地已有文件不再下载，但仍补上缺失的拍摄时间和地理位置。
-  if (IgnoreExistingPhotos && fs.existsSync(savePath)) {
-    if (!photoInfo.is_video) await writePhotoExif(savePath, photoInfo);
-    console.log(`本地文件已存在，跳过下载：${savePath}`);
-    return;
-  }
+  let photoName = "";
+  let savePath = "";
+  let fileUrl = "";
 
   try {
+    // 优先 raw，其次 origin_url（原图），最后用压缩后的 url。
+    fileUrl = photoInfo.raw || photoInfo.origin_url || photoInfo.url;
+    if (photoInfo.is_video) {
+      fileUrl = await Photos.getVideoUrl(albumInfo, photoInfo);
+    }
+
+    const baseName = Photos.parsePhotoName(photoInfo);
+    photoName = baseName + (photoInfo.is_video ? ".mp4" : ".jpg");
+
+    if (!fileUrl) {
+      throw new Error(
+        `未获取到下载链接，photo.lloc=${photoInfo.lloc}, album.id=${albumInfo.id}`
+      );
+    }
+
+    const savedFolderPath = path.join(exportDir, albumName);
+    if (!fs.existsSync(savedFolderPath))
+      fs.mkdirSync(savedFolderPath, { recursive: true });
+
+    savePath = path.join(savedFolderPath, photoName);
+
+    //本地已有文件不再下载，但仍补上缺失的拍摄时间和地理位置。
+    if (IgnoreExistingPhotos) {
+      const existing = photoInfo.is_video
+        ? fs.existsSync(savePath)
+          ? savePath
+          : ""
+        : findSavedPhoto(savedFolderPath, baseName);
+      if (existing) {
+        savePath = photoInfo.is_video
+          ? existing
+          : await writePhotoExif(existing, photoInfo, albumInfo);
+        console.log(`本地文件已存在，跳过下载：${savePath}`);
+        return;
+      }
+    }
+
     // 下载图片到本地
     const response = await axios({
       url: fileUrl,
@@ -564,13 +751,21 @@ async function downloadFile(photoInfo, albumInfo) {
     });
 
     fs.writeFileSync(savePath, Buffer.from(response.data));
+    if (!photoInfo.is_video) savePath = alignImageExtension(savePath);
     console.log(`下载成功：${savePath}`);
 
     await Tools.sleep(300);
 
-    if (!photoInfo.is_video) await writePhotoExif(savePath, photoInfo);
+    if (!photoInfo.is_video) await writePhotoExif(savePath, photoInfo, albumInfo);
   } catch (error) {
-    console.error("downloadFile出现错误：", error);
+    recordDownloadError({
+      album: albumInfo,
+      photo: photoInfo,
+      photoName,
+      savePath,
+      fileUrl,
+      error,
+    });
   }
 }
 
@@ -606,6 +801,12 @@ async function start() {
       } else {
         console.log(`相册 ${album.name} 没有照片，跳过。`);
       }
+    }
+
+    if (downloadErrorCount > 0) {
+      console.error(
+        `共 ${downloadErrorCount} 条失败，详情已写入 ${errorLogPath}`
+      );
     }
   } finally {
     await exiftool.end();
