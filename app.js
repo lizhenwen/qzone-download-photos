@@ -52,21 +52,58 @@ const Tools = {
       setTimeout(resolve, ms);
     });
   },
-  formatExifTime(input) {
-    input = (input || "").trim();
-    const dateRegex1 = /(\d{4}):(\d{2}):(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/;
-    const dateRegex2 = /(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/;
-    let match;
-    if ((match = input.match(dateRegex1))) {
-      return input;
-    } else if ((match = input.match(dateRegex2))) {
-      return `${match[1]}:${match[2]}:${match[3]} ${match[4]}:${match[5]}:${match[6]}`;
-    } else {
-      return null;
+  // 0000-00-00、年份过早的时间不算拍摄时间。Date 对象和 ExifTool 读出的对象也能判断。
+  isRealShootTime(value) {
+    if (value == null || value === "") return false;
+    if (value instanceof Date) {
+      if (Number.isNaN(value.getTime())) return false;
+      const year = value.getFullYear();
+      return year >= 1980 && year <= 2100;
     }
+
+    let year;
+    let month;
+    let day;
+    let hour = 0;
+    let minute = 0;
+    let second = 0;
+    if (typeof value.year === "number") {
+      year = value.year;
+      month = value.month;
+      day = value.day;
+      hour = value.hour ?? 0;
+      minute = value.minute ?? 0;
+      second = value.second ?? 0;
+    } else {
+      const text = String(value.rawValue || value).trim();
+      const match = text.match(
+        /^(\d{4})[-:](\d{2})[-:](\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/
+      );
+      if (!match) return false;
+      year = Number(match[1]);
+      month = Number(match[2]);
+      day = Number(match[3]);
+      hour = Number(match[4] ?? 0);
+      minute = Number(match[5] ?? 0);
+      second = Number(match[6] ?? 0);
+    }
+    if (year < 1980 || year > 2100) return false;
+    if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+    if (hour > 23 || minute > 59 || second > 59) return false;
+    return true;
+  },
+  formatExifTime(input) {
+    input = String(input || "").trim();
+    const match = input.match(
+      /^(\d{4})[-:](\d{2})[-:](\d{2})\s+(\d{2}):(\d{2}):(\d{2})/
+    );
+    if (!match) return null;
+    const formatted = `${match[1]}:${match[2]}:${match[3]} ${match[4]}:${match[5]}:${match[6]}`;
+    return Tools.isRealShootTime(formatted) ? formatted : null;
   },
   // QQ 空间时间是北京时间。抓包里的 timeRange 用的是这段时间的 Unix 秒。
   qqTimeToUnix(input) {
+    if (!Tools.isRealShootTime(input)) return null;
     const text = String(input || "").trim();
     const match = text.match(
       /^(\d{4})[-:](\d{2})[-:](\d{2})\s+(\d{2}):(\d{2}):(\d{2})/
@@ -434,8 +471,13 @@ const Photos = {
     return rs;
   },
   parsePhotoName(photoInfo) {
-    //使用时间来命名
-    let date = photoInfo.rawshoottime || photoInfo.uploadtime;
+    //使用时间来命名。0000-00-00 不算拍摄时间，改用下一个时间。
+    let date =
+      [photoInfo.rawshoottime, photoInfo.uploadtime].find((value) =>
+        Tools.isRealShootTime(value)
+      ) ||
+      photoInfo.uploadtime ||
+      photoInfo.rawshoottime;
     const dateObj = new Date(date);
     const year = dateObj.getFullYear();
     const month = String(dateObj.getMonth() + 1).padStart(2, "0");
@@ -562,12 +604,15 @@ function findSavedPhoto(folder, baseName) {
 }
 
 function qzoneShootTime(photoInfo) {
-  return (
-    photoInfo?.exif?.originalTime ||
-    photoInfo.rawshoottime ||
-    photoInfo.uploadtime ||
-    ""
-  );
+  const candidates = [
+    photoInfo?.exif?.originalTime,
+    photoInfo?.rawshoottime,
+    photoInfo?.uploadtime,
+  ];
+  for (const value of candidates) {
+    if (Tools.isRealShootTime(value)) return String(value).trim();
+  }
+  return "";
 }
 
 // QQ 空间时间是北京时间。MP4 的整数时间按 UTC 保存，所以带上 +08:00。
@@ -579,16 +624,7 @@ function formatVideoTime(input) {
   return `${match[1]}:${match[2]}:${match[3]} ${match[4]}:${match[5]}:${match[6]}+08:00`;
 }
 
-function videoDateYear(value) {
-  if (value == null || value === "") return null;
-  if (typeof value.year === "number") return value.year;
-  const match = String(value.rawValue || value).match(/(\d{4})/);
-  if (!match) return null;
-  const year = Number(match[1]);
-  return Number.isFinite(year) ? year : null;
-}
-
-// QQ 转存的视频经常把 CreateDate 写成 0000:00:00，这种不算已有拍摄时间。
+// 0000:00:00 以及 exifr 把零日期解析成的 1899 年，都不算已有拍摄时间。
 function hasVideoShootTime(tags) {
   if (!tags) return false;
   return [
@@ -596,10 +632,7 @@ function hasVideoShootTime(tags) {
     tags.CreateDate,
     tags.MediaCreateDate,
     tags.DateTimeOriginal,
-  ].some((value) => {
-    const year = videoDateYear(value);
-    return year != null && year >= 1980 && year <= 2100;
-  });
+  ].some((value) => Tools.isRealShootTime(value));
 }
 
 async function writeExifTags(savePath, tags) {
@@ -631,9 +664,18 @@ async function writePhotoExif(savePath, photoInfo, albumInfo) {
   }
 
   const tags = {};
-  if (!exifData || !exifData.DateTimeOriginal) {
-    const dateTimeOriginal = Tools.formatExifTime(qzoneShootTime(photoInfo));
-    if (dateTimeOriginal) tags.DateTimeOriginal = dateTimeOriginal;
+  const dateTimeOriginal = Tools.formatExifTime(qzoneShootTime(photoInfo));
+  if (dateTimeOriginal) {
+    if (!Tools.isRealShootTime(exifData && exifData.DateTimeOriginal)) {
+      tags.DateTimeOriginal = dateTimeOriginal;
+    }
+    // 相机有时把这三项都写成 0000:00:00，exifr 会解析成 1899 年，仍要覆盖。
+    if (exifData?.CreateDate != null && !Tools.isRealShootTime(exifData.CreateDate)) {
+      tags.CreateDate = dateTimeOriginal;
+    }
+    if (exifData?.ModifyDate != null && !Tools.isRealShootTime(exifData.ModifyDate)) {
+      tags.ModifyDate = dateTimeOriginal;
+    }
   }
 
   const poi = photoInfo.poi;
