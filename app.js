@@ -561,9 +561,62 @@ function findSavedPhoto(folder, baseName) {
   return matched || found[0];
 }
 
+function qzoneShootTime(photoInfo) {
+  return (
+    photoInfo?.exif?.originalTime ||
+    photoInfo.rawshoottime ||
+    photoInfo.uploadtime ||
+    ""
+  );
+}
+
+// QQ 空间时间是北京时间。MP4 的整数时间按 UTC 保存，所以带上 +08:00。
+function formatVideoTime(input) {
+  const match = String(input || "")
+    .trim()
+    .match(/^(\d{4})[-:](\d{2})[-:](\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+  if (!match) return null;
+  return `${match[1]}:${match[2]}:${match[3]} ${match[4]}:${match[5]}:${match[6]}+08:00`;
+}
+
+function videoDateYear(value) {
+  if (value == null || value === "") return null;
+  if (typeof value.year === "number") return value.year;
+  const match = String(value.rawValue || value).match(/(\d{4})/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  return Number.isFinite(year) ? year : null;
+}
+
+// QQ 转存的视频经常把 CreateDate 写成 0000:00:00，这种不算已有拍摄时间。
+function hasVideoShootTime(tags) {
+  if (!tags) return false;
+  return [
+    tags.CreationDate,
+    tags.CreateDate,
+    tags.MediaCreateDate,
+    tags.DateTimeOriginal,
+  ].some((value) => {
+    const year = videoDateYear(value);
+    return year != null && year >= 1980 && year <= 2100;
+  });
+}
+
 async function writeExifTags(savePath, tags) {
   await exiftool.write(savePath, tags, {
     writeArgs: ["-overwrite_original", "-charset", "utf8"],
+  });
+}
+
+async function writeVideoTags(savePath, tags) {
+  await exiftool.write(savePath, tags, {
+    writeArgs: [
+      "-overwrite_original",
+      "-api",
+      "QuickTimeUTC",
+      "-charset",
+      "utf8",
+    ],
   });
 }
 
@@ -579,11 +632,7 @@ async function writePhotoExif(savePath, photoInfo, albumInfo) {
 
   const tags = {};
   if (!exifData || !exifData.DateTimeOriginal) {
-    const dateTimeOriginal = Tools.formatExifTime(
-      photoInfo?.exif?.originalTime ||
-        photoInfo.rawshoottime ||
-        photoInfo.uploadtime
-    );
+    const dateTimeOriginal = Tools.formatExifTime(qzoneShootTime(photoInfo));
     if (dateTimeOriginal) tags.DateTimeOriginal = dateTimeOriginal;
   }
 
@@ -639,6 +688,92 @@ async function writePhotoExif(savePath, photoInfo, albumInfo) {
       fileUrl: photoInfo?.raw || photoInfo?.origin_url || photoInfo?.url || "",
       error: err,
       stage: "写入 Exif",
+    });
+  }
+  return savePath;
+}
+
+async function writeVideoTime(savePath, photoInfo, albumInfo) {
+  let existing = null;
+  try {
+    existing = await exiftool.read(savePath);
+  } catch (error) {
+    console.error(`读取视频时间失败：${savePath} ${error.message || error}`);
+  }
+  if (hasVideoShootTime(existing)) return savePath;
+
+  const when = formatVideoTime(qzoneShootTime(photoInfo));
+  if (!when) return savePath;
+
+  const tags = {
+    CreateDate: when,
+    ModifyDate: when,
+    TrackCreateDate: when,
+    TrackModifyDate: when,
+    MediaCreateDate: when,
+    MediaModifyDate: when,
+    "QuickTime:CreationDate": when,
+  };
+
+  try {
+    await writeVideoTags(savePath, tags);
+    console.log(`写入视频拍摄时间：${savePath}`);
+  } catch (err) {
+    recordDownloadError({
+      album: albumInfo,
+      photo: photoInfo,
+      photoName: path.basename(savePath),
+      savePath,
+      fileUrl: photoInfo?.raw || photoInfo?.origin_url || photoInfo?.url || "",
+      error: err,
+      stage: "写入拍摄时间",
+    });
+  }
+  return savePath;
+}
+
+function shootTimeMs(photoInfo) {
+  const when = formatVideoTime(qzoneShootTime(photoInfo));
+  if (!when) return null;
+  const match = when.match(
+    /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})([+-]\d{2}:\d{2})$/
+  );
+  if (!match) return null;
+  const ms = Date.parse(
+    `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}${match[7]}`
+  );
+  return Number.isNaN(ms) ? null : ms;
+}
+
+// 文件属性里的创建时间。放在 EXIF / 视频时间写入之后，避免覆盖原文件时被改回当前时间。
+async function setFileCreateTime(savePath, photoInfo, albumInfo) {
+  const ms = shootTimeMs(photoInfo);
+  if (ms == null || !savePath || !fs.existsSync(savePath)) return savePath;
+
+  try {
+    const birthtimeMs = fs.statSync(savePath).birthtimeMs;
+    if (Math.abs(birthtimeMs - ms) < 1000) return savePath;
+  } catch (error) {
+    console.error(`读取文件创建时间失败：${savePath} ${error.message || error}`);
+  }
+
+  const when = formatVideoTime(qzoneShootTime(photoInfo));
+  try {
+    await exiftool.write(
+      savePath,
+      { FileCreateDate: when },
+      { writeArgs: ["-overwrite_original", "-charset", "utf8"] }
+    );
+    console.log(`写入文件创建时间：${savePath}`);
+  } catch (err) {
+    recordDownloadError({
+      album: albumInfo,
+      photo: photoInfo,
+      photoName: path.basename(savePath),
+      savePath,
+      fileUrl: photoInfo?.raw || photoInfo?.origin_url || photoInfo?.url || "",
+      error: err,
+      stage: "写入创建时间",
     });
   }
   return savePath;
@@ -728,7 +863,7 @@ async function downloadFile(photoInfo, albumInfo) {
 
     savePath = path.join(savedFolderPath, photoName);
 
-    //本地已有文件不再下载，但仍补上缺失的拍摄时间和地理位置。
+    //本地已有文件不再下载，但仍补上缺失的拍摄时间、地理位置和文件创建时间。
     if (IgnoreExistingPhotos) {
       const existing = photoInfo.is_video
         ? fs.existsSync(savePath)
@@ -737,8 +872,9 @@ async function downloadFile(photoInfo, albumInfo) {
         : findSavedPhoto(savedFolderPath, baseName);
       if (existing) {
         savePath = photoInfo.is_video
-          ? existing
+          ? await writeVideoTime(existing, photoInfo, albumInfo)
           : await writePhotoExif(existing, photoInfo, albumInfo);
+        await setFileCreateTime(savePath, photoInfo, albumInfo);
         console.log(`本地文件已存在，跳过下载：${savePath}`);
         return;
       }
@@ -756,7 +892,10 @@ async function downloadFile(photoInfo, albumInfo) {
 
     await Tools.sleep(300);
 
-    if (!photoInfo.is_video) await writePhotoExif(savePath, photoInfo, albumInfo);
+    savePath = photoInfo.is_video
+      ? await writeVideoTime(savePath, photoInfo, albumInfo)
+      : await writePhotoExif(savePath, photoInfo, albumInfo);
+    await setFileCreateTime(savePath, photoInfo, albumInfo);
   } catch (error) {
     recordDownloadError({
       album: albumInfo,
